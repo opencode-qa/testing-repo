@@ -1,6 +1,6 @@
 ---
 title: "🎯 v0.0.0 - Initial Maven Setup"
-assignees: Anuj-Kumar-QA
+assignees: opencode-qa
 reviewers: Anuj-Patiyal
 milestone: v0.0.0
 linked_issue: 1

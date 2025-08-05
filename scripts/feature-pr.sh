@@ -12,13 +12,23 @@ PASS_ICON="${GREEN}✓${NC}"
 FAIL_ICON="${RED}✗${NC}"
 PROCESS_ICON="${ORANGE}🟡${NC}"
 
-# === CONFIGURATION ===
-TARGET_BRANCH="dev"
-DEFAULT_METADATA_DIR=".github/features"
+# === PROGRESS BAR SETUP ===
+bar_animation() {
+  local pid=$1
+  local delay=0.1
+  local spinstr='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do
+    for i in $(seq 0 3); do
+      printf "\r${ORANGE}[%c]${NC} " "${spinstr:i:1}"
+      sleep $delay
+    done
+  done
+  printf "\r"
+}
 
-# === HELPERS ===
 print_step() {
-  local icon=$1 message=$2
+  local icon=$1
+  local message=$2
   echo -e "$icon ${WHITE}${message}${NC}"
 }
 
@@ -27,23 +37,22 @@ abort_with_error() {
   exit 1
 }
 
-# Parse YAML field that can be string or array, return comma-separated string without spaces
 parse_list_or_string() {
   local input="$1"
+  # Try parsing with yq as array or string, fallback to input as-is
   echo "$input" | yq 'if type == "!!seq" then join(",") else . end' 2>/dev/null || echo "$input"
 }
 
 trim_commas_spaces() {
-  # Remove spaces after commas in a string
   echo "$1" | sed 's/, */,/g'
 }
 
-# === DEPENDENCIES CHECK ===
+# Check dependencies
 for cmd in gh yq jq git; do
   command -v "$cmd" >/dev/null || abort_with_error "Required command '$cmd' not installed."
 done
 
-# === ARGUMENT PARSING ===
+# === ARG PARSING ===
 TITLE=""
 BODY=""
 LABEL=""
@@ -60,23 +69,22 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# === BRANCH DETECTION ===
+TARGET_BRANCH="dev"
+DEFAULT_METADATA_DIR=".github/features"
+
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 print_step "$PROCESS_ICON" "Current branch detected: ${CURRENT_BRANCH}"
 print_step "$PROCESS_ICON" "Target branch for PR: ${TARGET_BRANCH}"
 
-# === METADATA FILE ===
 BRANCH_KEY="${CURRENT_BRANCH#feature/}"
 METADATA_FILE="${DEFAULT_METADATA_DIR}/${BRANCH_KEY}.md"
 [[ -f "$METADATA_FILE" ]] || abort_with_error "Metadata file '${METADATA_FILE}' not found."
 
-# === EXTRACT FRONT MATTER (YAML) ===
 extract_front_matter() {
   awk 'BEGIN {found=0} /^---$/ {found+=1; next} found==1 {print}' "$1"
 }
 FRONT_MATTER=$(extract_front_matter "$METADATA_FILE")
 
-# === PARSE METADATA FIELDS ===
 RAW_ASSIGNEES=$(echo "$FRONT_MATTER" | yq '.assignees // ""' 2>/dev/null || echo "")
 RAW_REVIEWERS=$(echo "$FRONT_MATTER" | yq '.reviewers // ""' 2>/dev/null || echo "")
 RAW_LINKED_ISSUE=$(echo "$FRONT_MATTER" | yq '.linked_issue // ""' 2>/dev/null || echo "")
@@ -99,23 +107,19 @@ LABELS=$(trim_commas_spaces "$LABELS")
 
 print_step "$PASS_ICON" "Parsed metadata from ${METADATA_FILE}"
 
-# === EXTRACT PR BODY CONTENT ===
 extract_body_content() {
   awk '/^---$/ {count++; next} count >= 2 {print}' "$1"
 }
 BODY_CONTENT=$(extract_body_content "$METADATA_FILE")
 
-# Override body content if --body passed
 [[ -n "$BODY" ]] && BODY_CONTENT="$BODY"
 
-# Append linked issue reference if present
 if [[ -n "$LINKED_ISSUE" ]]; then
   BODY_CONTENT="$BODY_CONTENT
 
 Linked issue: #$LINKED_ISSUE"
 fi
 
-# === DRY RUN MODE ===
 if $DRY_RUN; then
   echo -e "\n${ORANGE}--- Dry Run Mode ---${NC}"
   echo "Title       : $TITLE"
@@ -128,8 +132,11 @@ if $DRY_RUN; then
   exit 0
 fi
 
-# === CHECK IF PR ALREADY EXISTS ===
-print_step "$PROCESS_ICON" "Checking for existing Pull Request from branch '$CURRENT_BRANCH' to '$TARGET_BRANCH'..."
+print_step "$PROCESS_ICON" "Checking for existing Pull Request..."
+(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,url,state --limit 1) &
+pid=$!; bar_animation $pid
+wait $pid
+
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
 EXISTING_PR_JSON=$(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,url,state --limit 1)
@@ -138,14 +145,13 @@ EXISTING_PR_URL=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].url // empty')
 EXISTING_PR_STATE=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].state // empty')
 
 if [[ -n "$EXISTING_PR_NUMBER" ]]; then
-  print_step "$PROCESS_ICON" "Existing PR #$EXISTING_PR_NUMBER found with state '$EXISTING_PR_STATE'."
-
-  # If PR is closed, reopen it
+  print_step "$PROCESS_ICON" "Found existing PR #$EXISTING_PR_NUMBER with state '$EXISTING_PR_STATE'."
   if [[ "$EXISTING_PR_STATE" == "closed" ]]; then
     print_step "$PROCESS_ICON" "Reopening PR #$EXISTING_PR_NUMBER..."
-    gh pr reopen "$EXISTING_PR_NUMBER" >/dev/null || abort_with_error "Failed to reopen PR #$EXISTING_PR_NUMBER."
+    (gh pr reopen "$EXISTING_PR_NUMBER") &
+    pid=$!; bar_animation $pid
+    wait $pid || abort_with_error "Failed to reopen PR #$EXISTING_PR_NUMBER."
   fi
-
   PR_NUMBER="$EXISTING_PR_NUMBER"
   PR_URL="$EXISTING_PR_URL"
 else
@@ -153,8 +159,13 @@ else
   PR_URL=""
 fi
 
-# === CHECK GITHUB ACTIONS STATUS ===
 print_step "$PROCESS_ICON" "Checking GitHub Actions status for branch '$CURRENT_BRANCH'..."
+(run_status_cmd() {
+  gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1"
+}) &
+pid=$!; bar_animation $pid
+wait $pid
+
 RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" | jq -r '
   if (.workflow_runs | length) == 0 then
     "no-runs"
@@ -171,33 +182,34 @@ fi
 
 print_step "$PASS_ICON" "CI checks passed."
 
-# === CREATE OR UPDATE PULL REQUEST ===
 if [[ -z "$PR_NUMBER" ]]; then
   print_step "$PROCESS_ICON" "Creating Pull Request..."
-  PR_CREATE_OUTPUT=$(gh pr create \
+  (gh pr create \
     --title "$TITLE" \
     --body "$BODY_CONTENT" \
     --base "$TARGET_BRANCH" \
-    --head "$CURRENT_BRANCH" 2>&1) || {
-      echo -e "${RED}${FAIL_ICON} Failed to create PR. Output:${NC}"
-      echo "$PR_CREATE_OUTPUT"
-      exit 1
-  }
-  PR_NUMBER=$(echo "$PR_CREATE_OUTPUT" | grep -Eo 'https://github.com/.*/pull/[0-9]+' | grep -Eo '[0-9]+$')
-  PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+    --head "$CURRENT_BRANCH") &
+  pid=$!; bar_animation $pid
+  wait $pid || abort_with_error "Failed to create PR."
+
+  # Fetch created PR number and URL
+  PR_CREATE_OUTPUT=$(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,url --limit 1)
+  PR_NUMBER=$(echo "$PR_CREATE_OUTPUT" | jq -r '.[0].number')
+  PR_URL=$(echo "$PR_CREATE_OUTPUT" | jq -r '.[0].url')
   print_step "$PASS_ICON" "Pull Request created: $PR_URL"
 else
   print_step "$PROCESS_ICON" "Updating existing Pull Request #$PR_NUMBER..."
-  gh pr edit "$PR_NUMBER" --title "$TITLE" --body "$BODY_CONTENT" >/dev/null || abort_with_error "Failed to update PR #$PR_NUMBER."
+  (gh pr edit "$PR_NUMBER" --title "$TITLE" --body "$BODY_CONTENT") &
+  pid=$!; bar_animation $pid
+  wait $pid || abort_with_error "Failed to update PR #$PR_NUMBER."
   print_step "$PASS_ICON" "Pull Request updated: $PR_URL"
 fi
 
-# === ADD LABELS ===
+# Labels
 if [[ -n "$LABELS" ]]; then
   IFS=',' read -r -a LABEL_ARRAY <<< "$LABELS"
   for label in "${LABEL_ARRAY[@]}"; do
     label_trimmed=$(echo "$label" | xargs)
-    # Check if label exists
     if ! gh label list | awk '{print $1}' | grep -qx "$label_trimmed"; then
       print_step "$PROCESS_ICON" "Label '$label_trimmed' not found, creating..."
       gh label create "$label_trimmed" --color "ededed" --description "Auto-created label" >/dev/null 2>&1 || \
@@ -209,7 +221,7 @@ if [[ -n "$LABELS" ]]; then
   done
 fi
 
-# === ASSIGNEES ===
+# Assignees
 if [[ -n "$ASSIGNEES" ]]; then
   IFS=',' read -r -a ASSIGNEE_ARRAY <<< "$ASSIGNEES"
   for assignee in "${ASSIGNEE_ARRAY[@]}"; do
@@ -219,7 +231,7 @@ if [[ -n "$ASSIGNEES" ]]; then
   done
 fi
 
-# === REVIEWERS ===
+# Reviewers
 if [[ -n "$REVIEWERS" ]]; then
   IFS=',' read -r -a REVIEWER_ARRAY <<< "$REVIEWERS"
   for reviewer in "${REVIEWER_ARRAY[@]}"; do
@@ -229,7 +241,7 @@ if [[ -n "$REVIEWERS" ]]; then
   done
 fi
 
-# === MILESTONE ===
+# Milestone
 if [[ -n "$MILESTONE" ]]; then
   MILESTONE_ID=$(gh api "repos/$REPO/milestones" | jq ".[] | select(.title == \"$MILESTONE\") | .number")
   if [[ -n "$MILESTONE_ID" && "$MILESTONE_ID" != "null" ]]; then
