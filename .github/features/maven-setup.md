@@ -2,8 +2,8 @@
 title: "🎯 v0.0.0 - Initial Maven Setup"
 assignees: Anuj-Kumar-QA
 reviewers: Anuj-Patiyal
-linked_issue: 1
 milestone: v0.0.0
+linked_issue: 1
 labels: automation, setup, dependencies, maven
 ---
 
