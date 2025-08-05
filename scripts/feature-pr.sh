@@ -13,9 +13,9 @@ PASS_ICON="${GREEN}✓${NC}"
 FAIL_ICON="${RED}✗${NC}"
 PROCESS_ICON="${ORANGE}🟡${NC}"
 INFO_ICON="${BLUE}🔵${NC}"
-TROPHY_ICON="${GREEN}🏆${NC}"
 
-# === PROGRESS BAR & SPINNER ===
+# === PROGRESS BAR SETUP ===
+
 bar_animation() {
   local pid=$1
   local delay=0.1
@@ -32,11 +32,11 @@ bar_animation() {
 print_step() {
   local icon=$1
   local message=$2
-  echo -e "$icon ${WHITE}${message}${NC}"
+  echo -e "${icon} ${message}${NC}"
 }
 
 abort_with_error() {
-  echo -e "${RED}${FAIL_ICON} ${1}${NC}"
+  echo -e "${FAIL_ICON} ${RED}${1}${NC}"
   exit 1
 }
 
@@ -47,31 +47,6 @@ parse_list_or_string() {
 
 trim_commas_spaces() {
   echo "$1" | sed 's/, */,/g'
-}
-
-print_progress_bar() {
-  local total=20
-  local filled=$1
-  local empty=$((total - filled))
-  local bar=""
-
-  for ((i=0; i<filled; i++)); do
-    bar+="🟩"
-  done
-  for ((i=0; i<empty; i++)); do
-    bar+="⬜"
-  done
-
-  printf "Progress: [%s] %d%% (%d/%d)\n" "$bar" $((filled * 100 / total)) "$filled" "$total"
-}
-
-print_final_progress_bar() {
-  print_progress_bar 20
-}
-
-print_final_message() {
-  local message="${GREEN}Feature PR process completed successfully! 🎉${NC}"
-  echo -e "$TROPHY_ICON $message"
 }
 
 # Check dependencies
@@ -100,8 +75,8 @@ TARGET_BRANCH="dev"
 DEFAULT_METADATA_DIR=".github/features"
 
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-print_step "$INFO_ICON" "Current branch detected: ${CURRENT_BRANCH}"
-print_step "$PROCESS_ICON" "Target branch for PR: ${TARGET_BRANCH}"
+print_step "${INFO_ICON}" "${BLUE}Current branch detected:${NC} ${CURRENT_BRANCH}"
+print_step "${PROCESS_ICON}" "Target branch for PR: ${TARGET_BRANCH}"
 
 BRANCH_KEY="${CURRENT_BRANCH#feature/}"
 METADATA_FILE="${DEFAULT_METADATA_DIR}/${BRANCH_KEY}.md"
@@ -132,7 +107,7 @@ LABELS=$(trim_commas_spaces "$LABELS")
 [[ -z "$TITLE" ]] && TITLE="$RAW_TITLE"
 [[ -z "$TITLE" ]] && TITLE="Untitled PR"
 
-print_step "$PASS_ICON" "Parsed metadata from ${METADATA_FILE}"
+print_step "${PASS_ICON}" "Parsed metadata from ${METADATA_FILE}"
 
 extract_body_content() {
   awk '/^---$/ {count++; next} count >= 2 {print}' "$1"
@@ -159,7 +134,7 @@ if $DRY_RUN; then
   exit 0
 fi
 
-print_step "$PROCESS_ICON" "Checking for existing Pull Request..."
+print_step "${PROCESS_ICON}" "Checking for existing Pull Request..."
 (gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,url,state --limit 1) &
 pid=$!; bar_animation $pid
 wait $pid
@@ -172,12 +147,13 @@ EXISTING_PR_URL=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].url // empty')
 EXISTING_PR_STATE=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].state // empty')
 
 if [[ -n "$EXISTING_PR_NUMBER" ]]; then
-  print_step "$PROCESS_ICON" "Found existing PR #$EXISTING_PR_NUMBER with state '$EXISTING_PR_STATE'."
+  print_step "${PROCESS_ICON}" "Found existing Pull Request #${EXISTING_PR_NUMBER} (${EXISTING_PR_STATE^^})."
+  print_step "${PROCESS_ICON}" "You can view it here: ${EXISTING_PR_URL}"
   if [[ "$EXISTING_PR_STATE" == "closed" ]]; then
-    print_step "$PROCESS_ICON" "Reopening PR #$EXISTING_PR_NUMBER..."
+    print_step "${PROCESS_ICON}" "Reopening PR #${EXISTING_PR_NUMBER}..."
     (gh pr reopen "$EXISTING_PR_NUMBER") &
     pid=$!; bar_animation $pid
-    wait $pid || abort_with_error "Failed to reopen PR #$EXISTING_PR_NUMBER."
+    wait $pid || abort_with_error "Failed to reopen PR #${EXISTING_PR_NUMBER}."
   fi
   PR_NUMBER="$EXISTING_PR_NUMBER"
   PR_URL="$EXISTING_PR_URL"
@@ -186,32 +162,49 @@ else
   PR_URL=""
 fi
 
-print_step "$PROCESS_ICON" "Checking GitHub Actions status for branch '$CURRENT_BRANCH'..."
-(run_status_cmd() {
-  gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1"
-}) &
-pid=$!; bar_animation $pid
-wait $pid
+print_step "${PROCESS_ICON}" "Checking GitHub Actions status for branch '${CURRENT_BRANCH}'..."
 
-RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" | jq -r '
-  if (.workflow_runs | length) == 0 then
-    "no-runs"
-  else
-    "\(.workflow_runs[0].status)-\(.workflow_runs[0].conclusion)"
-  end
-')
+# --- Retry loop to wait for CI completion ---
+MAX_RETRIES=20      # Max retries (~2 min if delay=6s)
+RETRY_DELAY=6       # Delay seconds between checks
+retries=0
+RUN_STATUS=""
 
-if [[ "$RUN_STATUS" == "no-runs" ]]; then
-  abort_with_error "No GitHub Actions runs found on branch '$CURRENT_BRANCH'. Please push commits or check workflows."
-elif [[ "$RUN_STATUS" != "completed-success" ]]; then
-  abort_with_error "CI checks not passed. Status: $RUN_STATUS. PR creation aborted."
+while [[ $retries -lt $MAX_RETRIES ]]; do
+  RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" | jq -r '
+    if (.workflow_runs | length) == 0 then
+      "no-runs"
+    else
+      "\(.workflow_runs[0].status)-\(.workflow_runs[0].conclusion)"
+    end
+  ')
+
+  case "$RUN_STATUS" in
+    "completed-success")
+      print_step "${PASS_ICON}" "CI checks passed."
+      break
+      ;;
+    "completed-"*|"completed-failure"|"completed-cancelled"|"completed-skipped")
+      abort_with_error "CI checks did not pass. Status: $RUN_STATUS. PR creation aborted."
+      ;;
+    "no-runs")
+      abort_with_error "No GitHub Actions runs found on branch '$CURRENT_BRANCH'. Please push commits or check workflows."
+      ;;
+    *)
+      print_step "${PROCESS_ICON}" "CI status is '$RUN_STATUS'. Waiting for completion... (retry $((retries+1))/${MAX_RETRIES})"
+      ;;
+  esac
+
+  retries=$((retries+1))
+  sleep $RETRY_DELAY
+done
+
+if [[ $retries -eq $MAX_RETRIES ]]; then
+  abort_with_error "Timeout waiting for CI checks to complete."
 fi
 
-print_step "$PASS_ICON" "CI checks passed."
-print_progress_bar 19
-
 if [[ -z "$PR_NUMBER" ]]; then
-  print_step "$PROCESS_ICON" "Creating Pull Request..."
+  print_step "${PROCESS_ICON}" "Creating Pull Request..."
   (gh pr create \
     --title "$TITLE" \
     --body "$BODY_CONTENT" \
@@ -220,68 +213,61 @@ if [[ -z "$PR_NUMBER" ]]; then
   pid=$!; bar_animation $pid
   wait $pid || abort_with_error "Failed to create PR."
 
+  # Fetch created PR number and URL
   PR_CREATE_OUTPUT=$(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,url --limit 1)
   PR_NUMBER=$(echo "$PR_CREATE_OUTPUT" | jq -r '.[0].number')
   PR_URL=$(echo "$PR_CREATE_OUTPUT" | jq -r '.[0].url')
-  print_step "$PASS_ICON" "Pull Request created: $PR_URL"
+
+  print_step "${PASS_ICON}" "Pull Request created: ${PR_URL}"
 else
-  print_step "$PROCESS_ICON" "Updating existing Pull Request #$PR_NUMBER..."
+  print_step "${PROCESS_ICON}" "Updating existing Pull Request #${PR_NUMBER}..."
   (gh pr edit "$PR_NUMBER" --title "$TITLE" --body "$BODY_CONTENT") &
   pid=$!; bar_animation $pid
-  wait $pid || abort_with_error "Failed to update PR #$PR_NUMBER."
-  print_step "$PASS_ICON" "Pull Request updated: $PR_URL"
+  wait $pid || abort_with_error "Failed to update PR."
+
+  print_step "${PASS_ICON}" "Pull Request updated: ${PR_URL}"
 fi
 
-# Labels
-if [[ -n "$LABELS" ]]; then
-  IFS=',' read -r -a LABEL_ARRAY <<< "$LABELS"
-  for label in "${LABEL_ARRAY[@]}"; do
-    label_trimmed=$(echo "$label" | xargs)
-    if ! gh label list | awk '{print $1}' | grep -qx "$label_trimmed"; then
-      print_step "$PROCESS_ICON" "Label '$label_trimmed' not found, creating..."
-      gh label create "$label_trimmed" --color "ededed" --description "Auto-created label" >/dev/null 2>&1 || \
-        print_step "$FAIL_ICON" "Failed to create label '$label_trimmed'"
-    fi
-    print_step "$PROCESS_ICON" "Adding label '$label_trimmed' to PR..."
-    gh pr edit "$PR_NUMBER" --add-label "$label_trimmed" >/dev/null 2>&1 || print_step "$FAIL_ICON" "Failed to add label '$label_trimmed'"
-  done
-fi
-
-# Assign to assignees
-if [[ -n "$ASSIGNEES" ]]; then
-  IFS=',' read -r -a ASSIGNEE_ARRAY <<< "$ASSIGNEES"
-  for assignee in "${ASSIGNEE_ARRAY[@]}"; do
-    assignee_trimmed=$(echo "$assignee" | xargs)
-    print_step "$PROCESS_ICON" "Assigning to: $assignee_trimmed"
-    gh pr edit "$PR_NUMBER" --add-assignee "$assignee_trimmed" >/dev/null 2>&1 || print_step "$FAIL_ICON" "Failed to assign $assignee_trimmed"
-  done
-fi
-
-# Request reviewers
-if [[ -n "$REVIEWERS" ]]; then
-  IFS=',' read -r -a REVIEWER_ARRAY <<< "$REVIEWERS"
-  for reviewer in "${REVIEWER_ARRAY[@]}"; do
-    reviewer_trimmed=$(echo "$reviewer" | xargs)
-    print_step "$PROCESS_ICON" "Requesting reviewer: $reviewer_trimmed"
-    gh pr review-request add "$PR_NUMBER" --reviewer "$reviewer_trimmed" >/dev/null 2>&1 || print_step "$FAIL_ICON" "Failed to add reviewer $reviewer_trimmed"
-  done
-fi
+# Add labels
+IFS=',' read -ra ADD_LABELS <<< "$LABELS"
+for lbl in "${ADD_LABELS[@]}"; do
+  lbl_trimmed="$(echo "$lbl" | xargs)"
+  if [[ -n "$lbl_trimmed" ]]; then
+    print_step "${PROCESS_ICON}" "Adding label '${lbl_trimmed}' to PR..."
+    gh pr edit "$PR_NUMBER" --add-label "$lbl_trimmed" >/dev/null || abort_with_error "Failed to add label '${lbl_trimmed}'."
+  fi
+done
 
 # Assign milestone
 if [[ -n "$MILESTONE" ]]; then
-  print_step "$PROCESS_ICON" "Assigning milestone: $MILESTONE"
-  gh pr edit "$PR_NUMBER" --milestone "$MILESTONE" >/dev/null 2>&1 || print_step "$FAIL_ICON" "Failed to assign milestone"
+  print_step "${PROCESS_ICON}" "Assigning milestone '${MILESTONE}'..."
+  gh pr edit "$PR_NUMBER" --milestone "$MILESTONE" >/dev/null || abort_with_error "Failed to assign milestone '${MILESTONE}'."
 fi
 
-# Final progress bar and success message
-print_final_progress_bar
-print_final_message
+# Assign assignees
+IFS=',' read -ra ASSIGNEES_ARR <<< "$ASSIGNEES"
+if [[ ${#ASSIGNEES_ARR[@]} -gt 0 && -n "${ASSIGNEES_ARR[0]}" ]]; then
+  print_step "${PROCESS_ICON}" "Assigning to: ${ASSIGNEES}"
+  gh pr edit "$PR_NUMBER" --add-assignee $ASSIGNEES >/dev/null || abort_with_error "Failed to assign PR."
+fi
 
-# Legend
+# Request reviewers
+IFS=',' read -ra REVIEWERS_ARR <<< "$REVIEWERS"
+if [[ ${#REVIEWERS_ARR[@]} -gt 0 && -n "${REVIEWERS_ARR[0]}" ]]; then
+  print_step "${PROCESS_ICON}" "Requesting reviewer(s): ${REVIEWERS}"
+  gh pr review-request add "$PR_NUMBER" --reviewer $REVIEWERS >/dev/null || abort_with_error "Failed to request reviewer(s)."
+fi
+
+# --- Final progress bar (full) ---
+FULL_BAR_LENGTH=20
+PROGRESS_FILL=$(printf '🟩%.0s' $(seq 1 $FULL_BAR_LENGTH))
+PROGRESS_EMPTY=$(printf '⬜%.0s' $(seq 1 $((FULL_BAR_LENGTH - FULL_BAR_LENGTH))))
+echo -e "\nProgress: [${PROGRESS_FILL}${PROGRESS_EMPTY}] 100% (Completed)"
+
+# --- Final success message ---
+print_step "${PASS_ICON}" "${GREEN}Feature PR process completed successfully! 🎉${NC}"
 echo -e "\nLegend:"
 echo -e "${INFO_ICON} Information"
 echo -e "${PROCESS_ICON} In Progress"
 echo -e "${PASS_ICON} Passed"
 echo -e "${FAIL_ICON} Failed"
-
-echo -e "${GREEN}✓ feature-pr.sh completed successfully!${NC}"
