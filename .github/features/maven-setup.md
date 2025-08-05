@@ -13,8 +13,7 @@ This PR introduces the initial setup for the **Java Selenium Hybrid Automation F
 
 
 ## 📂 Files Introduced or Modified
-
-```text
+```txt
 📦 java-selenium-hybrid-framework/
 ├── 📄 pom.xml              # Maven dependencies and plugins (🆕)
 ├── 📄 .gitignore           # Standard ignores for Java/Maven (🆕)
