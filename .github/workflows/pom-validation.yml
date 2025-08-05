@@ -1,0 +1,27 @@
+# .github/workflows/pom-validation.yml
+
+name: 🧪 Validate POM
+
+on:
+  pull_request:
+    paths:
+      - 'pom.xml'
+      - 'scripts/validate-pom.sh'
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  validate-pom:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔒 Set execute permission on script
+        run: chmod +x scripts/validate-pom.sh
+
+      - name: 🚀 Run POM Validator
+        run: ./scripts/validate-pom.sh
