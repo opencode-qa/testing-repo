@@ -6,14 +6,15 @@ on:
     branches:
       - main
       - dev
-      - feature/*  # Fixed: Removed backticks
+      - 'feature/*'
 
 jobs:
   validate-pom:
     runs-on: ubuntu-latest
     env:
-      REPORTS_DIR: ./pom-validation-reports  # Now in repo root
-      HTML_REPORT: true  # Ensure HTML report is generated
+      REPORTS_DIR: ./pom-validation-reports
+      HTML_REPORT: true
+      # STRICT_MODE: true  # Uncomment if you want warnings to fail the build
 
     steps:
       - name: 📥 Checkout code
@@ -28,15 +29,22 @@ jobs:
       - name: 📂 Create reports directory
         run: mkdir -p $REPORTS_DIR
 
-      - name: 🔒 Set execute permission on script
+      - name: 🔒 Make script executable
         run: chmod +x scripts/validate-pom.sh
 
-      - name: 🚀 Run POM Validator
-        run: ./scripts/validate-pom.sh
+      - name: 🚀 Run validation
+        id: validation
+        run: |
+          ./scripts/validate-pom.sh
+          echo "status=$?" >> $GITHUB_OUTPUT
 
-      - name: 📦 Upload validation report
-        if: always()  # Upload even if validation fails
+      - name: 📦 Upload report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pom-validation-report
           path: ${{ env.REPORTS_DIR }}/
+
+      - name: ❌ Fail if validation failed
+        if: steps.validation.outputs.status != '0'
+        run: exit 1
