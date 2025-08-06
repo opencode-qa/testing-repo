@@ -1,50 +1,27 @@
+# .github/workflows/pom-validation.yml
+
 name: 🧪 Validate POM
 
 on:
   pull_request:
+    paths:
+      - 'pom.xml'
+      - 'scripts/validate-pom.sh'
   push:
     branches:
       - main
       - dev
-      - 'feature/*'
 
 jobs:
   validate-pom:
     runs-on: ubuntu-latest
-    env:
-      REPORTS_DIR: ./Reports/pom-validation-report
-      HTML_REPORT: true
-      # STRICT_MODE: true  # Uncomment if you want warnings to fail the build
 
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: ☕ Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-
-      - name: 📂 Create reports directory
-        run: mkdir -p $REPORTS_DIR
-
-      - name: 🔒 Make script executable
+      - name: 🔒 Set execute permission on script
         run: chmod +x scripts/validate-pom.sh
 
-      - name: 🚀 Run validation
-        id: validation
-        run: |
-          ./scripts/validate-pom.sh
-          echo "status=$?" >> $GITHUB_OUTPUT
-
-      - name: 📦 Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pom-validation-report
-          path: ${{ env.REPORTS_DIR }}/
-
-      - name: ❌ Fail if validation failed
-        if: steps.validation.outputs.status != '0'
-        run: exit 1
+      - name: 🚀 Run POM Validator
+        run: ./scripts/validate-pom.sh
