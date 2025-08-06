@@ -62,7 +62,6 @@ screenshots/
 # Build tools cache
 .mvn/
 .mvnd/
-.html
 
 # Others
-Reports/*
+

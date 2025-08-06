@@ -12,7 +12,7 @@ jobs:
   validate-pom:
     runs-on: ubuntu-latest
     env:
-      REPORTS_DIR: ./pom-validation-reports
+      REPORTS_DIR: ./Reports/pom-validation-report
       HTML_REPORT: true
       # STRICT_MODE: true  # Uncomment if you want warnings to fail the build
 
