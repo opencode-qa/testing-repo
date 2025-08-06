@@ -3,7 +3,7 @@
 
 # === CONFIGURATION ===
 POM_FILE="${POM_FILE:-pom.xml}"
-REPORTS_DIR="${REPORTS_DIR:-../Reports}" # Goes in parent repository's Reports folder
+REPORTS_DIR="${REPORTS_DIR:-./Reports}" # Goes in parent repository's Reports folder
 HTML_REPORT="${HTML_REPORT:-true}"
 DEPENDENCY_GRAPH="${DEPENDENCY_GRAPH:-false}"
 STRICT_MODE="${STRICT_MODE:-false}"
