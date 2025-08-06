@@ -7,240 +7,173 @@ ORANGE='\033[38;5;214m'
 RED='\033[1;31m'
 WHITE='\033[1;37m'
 BLUE='\033[1;34m'
+BLACK='\033[1;30m'
 NC='\033[0m'
 
 ICON_PASS="${GREEN}✓${NC}"
+ICON_WARN="${ORANGE}⚠${NC}"
 ICON_FAIL="${RED}✗${NC}"
-ICON_WARN="${ORANGE}🟡${NC}"
-ICON_INFO="${BLUE}🔵${NC}"
+ICON_INFO="${BLUE}ℹ${NC}"
 ICON_SKIP="${WHITE}○${NC}"
+
+declare -A CHECKS_COUNT=( ["pass"]=0 ["warn"]=0 ["fail"]=0 ["info"]=0 ["skip"]=0 )
+declare -a CHECK_RESULTS
+
+# === HELPERS ===
+# Replaced non-breaking spaces with standard spaces
+log_info() { echo -e "${ICON_INFO} ${BLUE}$1${NC}"; CHECKS_COUNT[info]=$((CHECKS_COUNT[info]+1)); CHECK_RESULTS+=("info"); }
+log_warn() { echo -e "${ICON_WARN} ${ORANGE}$1${NC}"; CHECKS_COUNT[warn]=$((CHECKS_COUNT[warn]+1)); CHECK_RESULTS+=("warn"); }
+log_success() { echo -e "${ICON_PASS} ${GREEN}$1${NC}"; CHECKS_COUNT[pass]=$((CHECKS_COUNT[pass]+1)); CHECK_RESULTS+=("pass"); }
+log_error() { echo -e "${ICON_FAIL} ${RED}$1${NC}"; CHECKS_COUNT[fail]=$((CHECKS_COUNT[fail]+1)); CHECK_RESULTS+=("fail"); exit 1; }
+log_skip() { echo -e "${ICON_SKIP} ${WHITE}$1${NC}"; CHECKS_COUNT[skip]=$((CHECKS_COUNT[skip]+1)); CHECK_RESULTS+=("skip"); }
+
+trim_list() { echo "$1" | sed 's/, */,/g'; }
 
 # === PROGRESS BAR ===
 print_progress_bar() {
-  local total=20
-  local filled=$1
-  local percent=$(( (filled * 100) / total ))
-  local bar=""
-  for ((i=1; i<=total; i++)); do
-    if (( i <= filled )); then
-      bar+="🟩"
-    else
-      bar+="⬜"
-    fi
+  local total_checks=${#CHECK_RESULTS[@]}
+  local filled_bar=""
+
+  for result in "${CHECK_RESULTS[@]}"; do
+    case "$result" in
+      "pass") filled_bar+="🟩";;
+      "warn") filled_bar+="🟧";;
+      "fail") filled_bar+="🟥";;
+      "info") filled_bar+="🟦";;
+      "skip") filled_bar+="⬛";;
+    esac
   done
-  echo -e "Progress: [${bar}] ${percent}%"
+
+  echo -e "\nProgress: [${filled_bar}] 100% (${total_checks}/$total_checks checks)"
 }
 
-# === LOGGING HELPERS ===
-log_info()    { echo -e "${ICON_INFO} ${BLUE}$1${NC}"; }
-log_warn()    { echo -e "${ICON_WARN} ${ORANGE}$1${NC}"; }
-log_success() { echo -e "${ICON_PASS} ${GREEN}$1${NC}"; }
-log_error()   { echo -e "${ICON_FAIL} ${RED}$1${NC}"; exit 1; }
-log_skip()    { echo -e "${ICON_SKIP} ${WHITE}$1${NC}"; }
-
-# === BAR ANIMATION ===
-bar_animation() {
-  local pid=$1
-  local spinstr='|/-\'
-  while kill -0 "$pid" 2>/dev/null; do
-    for i in $(seq 0 3); do
-      printf "\r${ORANGE}[%c]${NC} " "${spinstr:i:1}"
-      sleep 0.1
-    done
-  done
-  printf "\r"
-}
-
-# === PARSE HELPERS ===
-parse_list_or_string() {
-  local input="$1"
-  echo "$input" | yq 'if type == "!!seq" then join(",") else . end' 2>/dev/null || echo "$input"
-}
-
-trim_commas_spaces() {
-  echo "$1" | sed 's/, */,/g'
-}
-
-# === CHECK REQUIRED TOOLS ===
+# === REQUIRED TOOLS ===
 for cmd in gh yq jq git; do
-  command -v "$cmd" >/dev/null || log_error "Required command '$cmd' not installed."
+  command -v "$cmd" >/dev/null || log_error "Missing required tool: $cmd"
 done
 
-# === ARG PARSING ===
-TITLE=""
-BODY=""
-LABEL=""
-DRY_RUN=false
-
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --title) TITLE="$2"; shift ;;
-    --body) BODY="$2"; shift ;;
-    --label) LABEL="$2"; shift ;;
-    --dry-run) DRY_RUN=true ;;
-    *) log_error "Unknown argument: $1" ;;
-  esac
-  shift
-done
-
+# === INIT ===
+START_TIME=$(date +%s)
 TARGET_BRANCH="dev"
-DEFAULT_METADATA_DIR=".github/features"
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH_KEY="${CURRENT_BRANCH#feature/}"
+METADATA_FILE=".github/features/${BRANCH_KEY}.md"
 
 log_info "Current branch detected: ${CURRENT_BRANCH}"
-log_warn "Target branch for PR: ${TARGET_BRANCH}"
+log_info "Target branch for PR: ${TARGET_BRANCH}"
 
-BRANCH_KEY="${CURRENT_BRANCH#feature/}"
-METADATA_FILE="${DEFAULT_METADATA_DIR}/${BRANCH_KEY}.md"
-
-[[ -f "$METADATA_FILE" ]] || log_error "Metadata file ${METADATA_FILE} not found!"
-
+[[ -f "$METADATA_FILE" ]] || log_error "Metadata file not found: $METADATA_FILE"
 log_success "Parsed metadata from ${METADATA_FILE}"
 
+# === EXTRACT METADATA ===
 extract_front_matter() {
-  awk 'BEGIN {found=0} /^---$/ {found+=1; next} found==1 {print}' "$1"
+  awk 'BEGIN{f=0} /^---$/{f++; next} f==1' "$1"
 }
-FRONT_MATTER=$(extract_front_matter "$METADATA_FILE")
-
-ASSIGNEES=$(parse_list_or_string "$(echo "$FRONT_MATTER" | yq '.assignees // ""')")
-REVIEWERS=$(parse_list_or_string "$(echo "$FRONT_MATTER" | yq '.reviewers // ""')")
-LABELS=$(parse_list_or_string "$(echo "$FRONT_MATTER" | yq '.labels // ""')")
-LINKED_ISSUE=$(echo "$FRONT_MATTER" | yq '.linked_issue // ""')
-MILESTONE=$(echo "$FRONT_MATTER" | yq '.milestone // ""')
-RAW_TITLE=$(echo "$FRONT_MATTER" | yq '.title // ""')
-
-ASSIGNEES=$(trim_commas_spaces "$ASSIGNEES")
-REVIEWERS=$(trim_commas_spaces "$REVIEWERS")
-LABELS=$(trim_commas_spaces "$LABELS")
-
-[[ -z "$TITLE" ]] && TITLE="$RAW_TITLE"
-[[ -z "$TITLE" ]] && TITLE="Untitled PR"
-
-extract_body_content() {
-  awk '/^---$/ {count++; next} count >= 2 {print}' "$1"
+extract_body() {
+  awk '/^---$/{f++} f==2' "$1"
 }
-BODY_CONTENT=$(extract_body_content "$METADATA_FILE")
 
-[[ -n "$BODY" ]] && BODY_CONTENT="$BODY"
-[[ -n "$LINKED_ISSUE" ]] && BODY_CONTENT="$BODY_CONTENT\n\nLinked issue: #$LINKED_ISSUE"
+FRONT=$(extract_front_matter "$METADATA_FILE")
+BODY=$(extract_body "$METADATA_FILE")
 
-if $DRY_RUN; then
-  log_info "--- Dry Run Mode ---"
-  echo -e "${BLUE}Title       : $TITLE${NC}"
-  echo -e "${BLUE}Assignees   : $ASSIGNEES${NC}"
-  echo -e "${BLUE}Reviewers   : $REVIEWERS${NC}"
-  echo -e "${BLUE}Milestone   : $MILESTONE${NC}"
-  echo -e "${BLUE}Labels      : $LABELS${NC}"
-  echo -e "${BLUE}Linked issue: #$LINKED_ISSUE${NC}"
-  echo -e "\n${WHITE}Body:${NC}\n$BODY_CONTENT"
-  exit 0
-fi
+TITLE=$(echo "$FRONT" | yq '.title // "Untitled PR"')
+BODY_CONTENT="$BODY"
+LINKED=$(echo "$FRONT" | yq '.linked_issue // ""')
+ASSIGNEES=$(trim_list "$(echo "$FRONT" | yq '.assignees // ""')")
+REVIEWERS=$(trim_list "$(echo "$FRONT" | yq '.reviewers // ""')")
+LABELS=$(trim_list "$(echo "$FRONT" | yq '.labels // ""')")
+MILESTONE=$(echo "$FRONT" | yq '.milestone // ""')
 
-log_warn "Checking for existing Pull Request..."
-EXISTING_PR_JSON=$(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,state,url --limit 1)
-PR_NUMBER=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].number // empty')
-PR_STATE=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].state // empty')
-PR_URL=$(echo "$EXISTING_PR_JSON" | jq -r '.[0].url // empty')
+[[ -n "$LINKED" ]] && BODY_CONTENT="$BODY_CONTENT\n\nLinked issue: #$LINKED"
+
+# === CHECK PR EXISTENCE ===
+log_info "Checking for existing Pull Request..."
+PR_DATA=$(gh pr list --head "$CURRENT_BRANCH" --base "$TARGET_BRANCH" --json number,state,url --limit 1)
+PR_NUMBER=$(echo "$PR_DATA" | jq -r '.[0].number // empty')
+PR_STATE=$(echo "$PR_DATA" | jq -r '.[0].state // empty')
+PR_URL=$(echo "$PR_DATA" | jq -r '.[0].url // empty')
 
 if [[ -n "$PR_NUMBER" ]]; then
-  log_warn "Found existing Pull Request #$PR_NUMBER ($PR_STATE)."
-  log_warn "You can view it here: $PR_URL"
-  if [[ "$PR_STATE" == "closed" ]]; then
-    log_warn "Reopening closed PR #$PR_NUMBER..."
-    gh pr reopen "$PR_NUMBER" || log_error "Failed to reopen PR."
-  fi
+  log_success "Found existing Pull Request #$PR_NUMBER ($PR_STATE)"
+  log_info "$PR_URL"
+  [[ "$PR_STATE" == "closed" ]] && gh pr reopen "$PR_NUMBER" && log_success "Reopened PR #$PR_NUMBER"
 else
-  log_info "No existing PR found. Will create a new one."
+  log_info "No existing PR found"
 fi
 
-# === CHECK CI STATUS WITH RETRY LOOP ===
-log_warn "Checking GitHub Actions status for branch '$CURRENT_BRANCH'..."
+# === CHECK CI STATUS ===
+log_info "Checking GitHub Actions status..."
 REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
 MAX_RETRIES=5
-RETRY_INTERVAL=10
 for ((i=1; i<=MAX_RETRIES; i++)); do
-  RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" |
-    jq -r 'if (.workflow_runs | length) == 0 then "no-runs" else "\(.workflow_runs[0].status)-\(.workflow_runs[0].conclusion)" end')
+  STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" |
+    jq -r '.workflow_runs[0] | "\(.status)-\(.conclusion)"')
 
-  if [[ "$RUN_STATUS" == "completed-success" ]]; then
+  if [[ "$STATUS" == "completed-success" ]]; then
     log_success "CI checks passed."
     break
-  elif [[ "$RUN_STATUS" == "no-runs" ]]; then
-    log_error "No CI runs found for this branch."
-  elif [[ "$i" -lt "$MAX_RETRIES" ]]; then
-    log_warn "CI in progress (status: $RUN_STATUS). Retrying in $RETRY_INTERVAL seconds... ($i/$MAX_RETRIES)"
-    sleep "$RETRY_INTERVAL"
+  elif [[ "$i" -lt $MAX_RETRIES ]]; then
+    log_info "CI status: $STATUS. Retrying ($i/$MAX_RETRIES)..."
+    sleep 5
   else
-    log_error "CI checks did not pass after retries. Status: $RUN_STATUS"
+    log_error "CI did not pass: $STATUS"
   fi
 done
 
-# === CREATE OR UPDATE PR ===
+# === CREATE / UPDATE PR ===
 if [[ -z "$PR_NUMBER" ]]; then
-  log_warn "Creating new Pull Request..."
-  PR_URL=$(gh pr create \
-    --title "$TITLE" \
-    --body "$BODY_CONTENT" \
-    --base "$TARGET_BRANCH" \
-    --head "$CURRENT_BRANCH")
-  log_success "Pull Request created: $PR_URL"
+  log_info "Creating new PR..."
+  PR_URL=$(gh pr create --title "$TITLE" --body "$BODY_CONTENT" --base "$TARGET_BRANCH" --head "$CURRENT_BRANCH")
+  log_success "Created PR: $PR_URL"
 else
-  log_warn "Updating existing Pull Request #$PR_NUMBER..."
+  log_info "Updating PR #$PR_NUMBER..."
   gh pr edit "$PR_NUMBER" --title "$TITLE" --body "$BODY_CONTENT"
-  log_success "Pull Request updated: $PR_URL"
+  log_success "Updated PR: $PR_URL"
 fi
 
-# === APPLY LABELS ===
+# === LABELS ===
 if [[ -n "$LABELS" ]]; then
-  IFS=',' read -ra LABEL_ARRAY <<< "$LABELS"
-  for label in "${LABEL_ARRAY[@]}"; do
-    label=$(echo "$label" | xargs)
-    log_warn "Adding label '$label' to PR..."
+  for label in $(echo "$LABELS" | tr ',' ' '); do
+    log_info "Adding label '$label'"
     gh pr edit "$PR_NUMBER" --add-label "$label" >/dev/null
   done
 fi
 
 # === MILESTONE ===
-if [[ -n "$MILESTONE" ]]; then
-  log_warn "Assigning milestone '$MILESTONE'..."
-  gh pr edit "$PR_NUMBER" --milestone "$MILESTONE" >/dev/null
-fi
+[[ -n "$MILESTONE" ]] && log_info "Assigning milestone '$MILESTONE'" && gh pr edit "$PR_NUMBER" --milestone "$MILESTONE"
 
 # === ASSIGNEES ===
-if [[ -n "$ASSIGNEES" ]]; then
-  log_warn "Assigning to: $ASSIGNEES..."
-  gh pr edit "$PR_NUMBER" --add-assignee "$ASSIGNEES" >/dev/null
-fi
+[[ -n "$ASSIGNEES" ]] && log_info "Assigning to: $ASSIGNEES" && gh pr edit "$PR_NUMBER" --add-assignee "$ASSIGNEES"
 
 # === REVIEWERS ===
 if [[ -n "$REVIEWERS" ]]; then
-  log_warn "Requesting reviewer(s): $REVIEWERS..."
-
-  # Fetch existing reviewers
+  log_info "Requesting reviewer(s): $REVIEWERS"
   EXISTING_REVIEWERS=$(gh pr view "$PR_NUMBER" --json reviewRequests -q '.reviewRequests[].login')
 
   for reviewer in $(echo "$REVIEWERS" | tr ',' ' '); do
     if echo "$EXISTING_REVIEWERS" | grep -q "^$reviewer$"; then
-      log_skip "Reviewer '$reviewer' is already assigned. Skipping..."
+      log_skip "Reviewer '$reviewer' already assigned."
     else
-      if gh pr review --request "$reviewer" 2>/dev/null; then
-        log_success "Requested reviewer: $reviewer"
+      if gh pr edit "$PR_NUMBER" --add-reviewer "$reviewer"; then
+        log_success "Reviewer '$reviewer' requested."
       else
-        log_warn "Could not request reviewer '$reviewer' (may already be assigned or invalid)."
+        log_warn "Failed to assign reviewer '$reviewer'."
       fi
     fi
   done
 fi
 
-# === FINAL SUCCESS ===
-print_progress_bar 20
-log_success "🎉 Feature Pull Request completed successfully! You can view it here: $PR_URL"
+# === SUMMARY ===
+print_progress_bar
 
-# === LEGEND ===
-echo -e "\nLegend:"
-echo -e "${ICON_INFO} ${BLUE}Information${NC}"
-echo -e "${ICON_WARN} ${ORANGE}In Progress${NC}"
-echo -e "${ICON_PASS} ${GREEN}Passed${NC}"
-echo -e "${ICON_FAIL} ${RED}Failed${NC}"
-echo -e "${ICON_SKIP} ${WHITE}Skipped${NC}"
+echo -e "\n📊 Validation Summary:"
+printf "  ${ICON_PASS} Passed    🟢  ⇒ %2d\n" "${CHECKS_COUNT[pass]}"
+printf "  ${ICON_WARN} Warnings  🟠  ⇒ %2d\n" "${CHECKS_COUNT[warn]}"
+printf "  ${ICON_FAIL} Failures  🔴  ⇒ %2d\n" "${CHECKS_COUNT[fail]}"
+printf "  ${ICON_INFO} Info      🔵  ⇒ %2d\n" "${CHECKS_COUNT[info]}"
+printf "  ${ICON_SKIP} Skipped   ⚫  ⇒ %2d\n" "${CHECKS_COUNT[skip]}"
+
+END_TIME=$(date +%s)
+echo -e "\n⏱ Completed in $((END_TIME - START_TIME)) seconds\n"
+log_success "🎉 Feature Pull Request completed successfully! View it at: $PR_URL"

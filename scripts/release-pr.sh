@@ -1,220 +1,135 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# === COLOR THEME & ICONS ===
-GREEN='\033[1;32m'; YELLOW='\033[1;33m'; RED='\033[1;31m'
-WHITE='\033[1;37m'; BLUE='\033[1;34m'; PURPLE='\033[1;35m'
-CYAN='\033[1;36m'; ORANGE='\033[38;5;214m'; NC='\033[0m'
+# === COLORS & ICONS ===
+GREEN='\033[1;32m'
+ORANGE='\033[1;33m'
+RED='\033[1;31m'
+WHITE='\033[1;37m'
+BLUE='\033[1;34m'
+BLACK='\033[1;30m' # Added BLACK color code
+BOLD='\033[1m'
+NC='\033[0m'
 
-PASS_ICON="${GREEN}✓${NC}"
-WARN_ICON="${ORANGE}⚠${NC}"
-FAIL_ICON="${RED}✗${NC}"
-SKIP_ICON="${WHITE}➤${NC}"
-OPTIONAL_ICON="${CYAN}◇${NC}"
+# Icons without embedded color codes; colors are applied by log functions or printf
+ICON_PASS="✓"
+ICON_FAIL="✗"
+ICON_WARN="💡"
+ICON_INFO="ℹ"
+ICON_SKIP="➤"
 
-ICON_SUCCESS="🟢"
-ICON_PROCESSING="🟡"
-ICON_FAILURE="🔴"
+declare -A CHECKS_COUNT=( ["pass"]=0 ["warn"]=0 ["info"]=0 ["skip"]=0 ["fail"]=0 )
+declare -a CHECK_RESULTS
 
-print_step() { echo -e "${1} ${2}${NC}"; }
-abort_with_error() { echo -e "${RED}${ICON_FAILURE} $1${NC}"; exit 1; }
-
-show_progress_bar() {
-  local current=$1 total=$2
-  local percent=$((100 * current / total))
-  local bar=""
-  for ((i = 0; i < total; i++)); do
-    if (( i < current )); then bar+="🟩"
-    else bar+="⬛"
-    fi
-  done
-  echo -e "\n${BLUE}Progress Summary:${NC}"
-  echo -e "[${bar}] ${percent}% ($current/$total tasks completed)"
+# === HELPERS ===
+get_display_width() {
+    echo -n "$1" | wc -m
 }
 
-# === CONFIGURATION ===
-TARGET_BRANCH="main"
-DEFAULT_METADATA_DIR=".github/releases"
-TITLE=""; BODY=""; DRY_RUN=false; METADATA_FILE=""
-declare -a COMPLETED_TASKS
-
-# === DEPENDENCY CHECK ===
-check_dependencies() {
-  for cmd in gh yq jq awk; do
-    if ! command -v "$cmd" &>/dev/null; then
-      abort_with_error "Required command '$cmd' not installed."
-    fi
-    COMPLETED_TASKS+=("dep-$cmd")
-  done
+log_info() {
+    printf "%b%s %s%b\n" "${BLUE}" "${ICON_INFO}" "$1" "${NC}"
+    CHECKS_COUNT[info]=$((CHECKS_COUNT[info]+1))
+    CHECK_RESULTS+=("info")
+}
+log_warn() {
+    printf "%b%s %s%b\n" "${ORANGE}" "${ICON_WARN}" "$1" "${NC}"
+    CHECKS_COUNT[warn]=$((CHECKS_COUNT[warn]+1))
+    CHECK_RESULTS+=("warn")
+}
+log_success() {
+    printf "%b%s %s%b\n" "${GREEN}" "${ICON_PASS}" "$1" "${NC}"
+    CHECKS_COUNT[pass]=$((CHECKS_COUNT[pass]+1))
+    CHECK_RESULTS+=("pass")
+}
+log_error() {
+    printf "%b%s %s%b\n" "${RED}" "${ICON_FAIL}" "$1" "${NC}"
+    CHECKS_COUNT[fail]=$((CHECKS_COUNT[fail]+1))
+    CHECK_RESULTS+=("fail")
+    exit 1
+}
+log_skip() {
+    # Changed log color for skipped checks to BLACK
+    printf "%b%s %s%b\n" "${BLACK}" "${ICON_SKIP}" "$1" "${NC}"
+    CHECKS_COUNT[skip]=$((CHECKS_COUNT[skip]+1))
+    CHECK_RESULTS+=("skip")
 }
 
-# === ARGUMENT PARSING ===
-parse_arguments() {
-  while [[ $# -gt 0 ]]; do
-    case $1 in
-      --title) TITLE="$2"; shift ;;
-      --body) BODY="$2"; shift ;;
-      --metadata) METADATA_FILE="$2"; shift ;;
-      --dry-run) DRY_RUN=true ;;
-      *) abort_with_error "Unknown argument: $1" ;;
-    esac
-    shift
-  done
-}
+# ---
+### Progress Bar and Summary
 
-# === NORMALIZE FIELD: converts YAML field (string or array) to comma-separated string ===
-normalize_field() {
-  local field="$1"
-  # If field missing or null => empty string
-  # If array => join(",")
-  # Else string as is
-  echo "$YAML_FRONT_MATTER" | yq -r "
-    if (.$field == null) then \"\"
-    elif (type == \"object\" and .$field | type == \"!!seq\") then .$field | join(\",\")
-    else .$field
-    end
-  "
-}
+The `print_progress_summary` function has been updated to use the black square emoji (`⬛`) for skipped checks and to apply the correct `BLACK` color code in the summary printout.
 
-# === EXTRACT BODY AFTER FRONTMATTER ===
-extract_body() {
-  awk '
-    BEGIN {in_frontmatter=0; frontmatter_done=0}
-    /^---$/ {
-      if (in_frontmatter==0) {in_frontmatter=1; next}
-      else if (in_frontmatter==1) {frontmatter_done=1; next}
-    }
-    frontmatter_done==1 {print}
-  ' "$METADATA_FILE"
-}
+```bash
+# === PROGRESS BAR ===
+print_progress_summary() {
+    local total=${#CHECK_RESULTS[@]}
+    local bar=""
 
-# === MAIN FUNCTION ===
-main() {
-  echo -e "${PURPLE}🚀 release-pr.sh — Create a GitHub Release Pull Request${NC}\n"
-
-  check_dependencies
-  parse_arguments "$@"
-
-  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-  print_step "$ICON_PROCESSING" "Current branch: $CURRENT_BRANCH"
-  print_step "$ICON_PROCESSING" "Target branch: $TARGET_BRANCH"
-  COMPLETED_TASKS+=("branch-checked")
-
-  # Locate metadata file if not provided
-  if [[ -z "$METADATA_FILE" ]]; then
-    BRANCH_KEY="${CURRENT_BRANCH#*/}"
-    METADATA_FILE="${DEFAULT_METADATA_DIR}/${BRANCH_KEY}.md"
-  fi
-  [[ -f "$METADATA_FILE" ]] || abort_with_error "Metadata file '$METADATA_FILE' not found."
-  COMPLETED_TASKS+=("metadata-located")
-
-  # Read YAML frontmatter (between first two --- lines)
-  YAML_FRONT_MATTER=$(awk 'BEGIN{in_yaml=0} /^---$/ {in_yaml+=1; next} in_yaml==1 {print}' "$METADATA_FILE")
-
-  # Normalize all fields using helper
-  ASSIGNEES=$(normalize_field "assignees")
-  REVIEWERS=$(normalize_field "reviewers")
-  LABELS=$(normalize_field "labels")
-  MILESTONE=$(normalize_field "milestone")
-  TITLE_VAL=$(normalize_field "title")
-  [[ -z "$TITLE" ]] && TITLE="$TITLE_VAL"
-  [[ -z "$TITLE" ]] && TITLE="Release PR"
-
-  # Extract or override body content
-  if [[ -z "$BODY" ]]; then
-    BODY_CONTENT=$(extract_body)
-  else
-    BODY_CONTENT="$BODY"
-  fi
-  COMPLETED_TASKS+=("metadata-parsed")
-
-  # Dry run mode: show parsed data and exit
-  if [[ "$DRY_RUN" == true ]]; then
-    echo -e "\n${YELLOW}--- Dry Run Mode ---${NC}"
-    echo "Title     : $TITLE"
-    echo "Assignees : $ASSIGNEES"
-    echo "Reviewers : $REVIEWERS"
-    echo "Milestone : $MILESTONE"
-    echo "Labels    : $LABELS"
-    echo "Metadata  : $METADATA_FILE"
-    echo -e "\nBody:\n$BODY_CONTENT"
-    exit 0
-  fi
-
-  # Check GitHub Actions CI status on current branch
-  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  print_step "$ICON_PROCESSING" "Checking CI status on branch '$CURRENT_BRANCH'..."
-  RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" | jq -r '
-    if (.workflow_runs | length)==0 then "no-runs"
-    else "\(.workflow_runs[0].status)-\(.workflow_runs[0].conclusion)" end
-  ')
-
-  if [[ "$RUN_STATUS" == "no-runs" ]]; then
-    abort_with_error "No GitHub Actions runs found on '$CURRENT_BRANCH'."
-  elif [[ "$RUN_STATUS" != "completed-success" ]]; then
-    abort_with_error "CI not passed (status=$RUN_STATUS)."
-  fi
-  print_step "$ICON_SUCCESS" "CI passed."
-  COMPLETED_TASKS+=("ci-ok")
-
-  # Create Pull Request
-  print_step "$ICON_PROCESSING" "Creating pull request..."
-  PR_OUT=$(gh pr create --title "$TITLE" --body "$BODY_CONTENT" --base "$TARGET_BRANCH" --head "$CURRENT_BRANCH" 2>&1) \
-    || abort_with_error "Failed to create PR: $PR_OUT"
-
-  PR_NUMBER=$(echo "$PR_OUT" | grep -Eo 'pull/[0-9]+' | grep -Eo '[0-9]+')
-  PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
-  print_step "$ICON_SUCCESS" "PR created: $PR_URL"
-  COMPLETED_TASKS+=("pr-created")
-
-  # Add Labels: ensure branch name as label always included
-  LABELS="$LABELS,${CURRENT_BRANCH##*/}"
-  # Clean duplicates and empty labels
-  mapfile -t UNIQUE_LABELS < <(echo "$LABELS" | tr ',' '\n' | awk '!x[$0]++ && length($0)>0')
-  for lbl in "${UNIQUE_LABELS[@]}"; do
-    # Check if label exists, if not create it
-    if ! gh label list | awk '{print $1}' | grep -qx "$lbl"; then
-      gh label create "$lbl" --color ededee --description "Auto label" >/dev/null
-    fi
-    gh pr edit "$PR_NUMBER" --add-label "$lbl" >/dev/null
-  done
-  COMPLETED_TASKS+=("labels-added")
-
-  # Assign assignees and reviewers if specified
-  if [[ -n "$ASSIGNEES" ]]; then
-    # split comma and assign each separately to avoid gh cli issues
-    IFS=',' read -ra ASSIGNEE_ARR <<< "$ASSIGNEES"
-    for assignee in "${ASSIGNEE_ARR[@]}"; do
-      gh pr edit "$PR_NUMBER" --add-assignee "$assignee" >/dev/null || print_step "$WARN_ICON" "Failed to assign: $assignee"
+    for result in "${CHECK_RESULTS[@]}"; do
+        case "$result" in
+            "pass") bar+="🟩";;
+            "warn") bar+="🟧";;
+            "skip") bar+="⬛";; # Changed to a black square emoji
+            "fail") bar+="🟥";;
+            "info") bar+="🟦";;
+        esac
     done
-    print_step "$ICON_SUCCESS" "Assigned: $ASSIGNEES"
-  fi
 
-  if [[ -n "$REVIEWERS" ]]; then
-    IFS=',' read -ra REVIEWER_ARR <<< "$REVIEWERS"
-    for reviewer in "${REVIEWER_ARR[@]}"; do
-      gh pr edit "$PR_NUMBER" --add-reviewer "$reviewer" >/dev/null || print_step "$WARN_ICON" "Failed to add reviewer: $reviewer"
+    echo -e "\n"
+    echo -e "${BOLD}Progress: [${bar}] 100% ($total/$total checks)${NC}"
+    echo -e "\n"
+
+    echo -e "${BOLD}📊 Summary:${NC}"
+
+    local max_summary_label_len=0
+    local labels_to_measure=("${ICON_PASS} Passed" "${ICON_WARN} Warnings" "${ICON_SKIP} Skipped" "${ICON_FAIL} Failures" "${ICON_INFO} Info")
+    for label_str in "${labels_to_measure[@]}"; do
+        local current_len=$(get_display_width "$label_str")
+        if (( current_len > max_summary_label_len )); then
+            max_summary_label_len="$current_len"
+        fi
     done
-    print_step "$ICON_SUCCESS" "Reviewers: $REVIEWERS"
-  fi
-  COMPLETED_TASKS+=("assignments-done")
+    max_summary_label_len=$((max_summary_label_len + 2))
 
-  # Set milestone if specified
-  if [[ -n "$MILESTONE" ]]; then
-    MID=$(gh api "repos/$REPO/milestones" -q ".milestones[] | select(.title == \"$MILESTONE\") | .number")
-    if [[ -n "$MID" ]]; then
-      gh pr edit "$PR_NUMBER" --milestone "$MID" >/dev/null
-      print_step "$ICON_SUCCESS" "Milestone set: $MILESTONE"
-    else
-      print_step "$WARN_ICON" "Milestone '$MILESTONE' not found."
-    fi
-    COMPLETED_TASKS+=("milestone-set")
-  fi
+    local padded_label_part
 
-  show_progress_bar "${#COMPLETED_TASKS[@]}" 10
+    # Passed line
+    local label_text="${ICON_PASS} Passed"
+    local current_label_display_len=$(get_display_width "$label_text")
+    local padding_needed=$((max_summary_label_len - current_label_display_len))
+    padded_label_part="${label_text}"
+    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
+    printf "%b  %s%3d%b\n" "${GREEN}${BOLD}" "$padded_label_part" "${CHECKS_COUNT[pass]}" "${NC}"
 
-  echo -e "\n${GREEN}🎉 Release PR process complete!${NC}"
-  echo "View your PR here: $PR_URL"
+    # Warnings line
+    label_text="${ICON_WARN} Warnings"
+    current_label_display_len=$(get_display_width "$label_text")
+    padding_needed=$((max_summary_label_len - current_label_display_len))
+    padded_label_part="${label_text}"
+    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
+    printf "%b  %s%3d%b\n" "${ORANGE}${BOLD}" "$padded_label_part" "${CHECKS_COUNT[warn]}" "${NC}"
+
+    # Skipped line - Updated color to BLACK
+    label_text="${ICON_SKIP} Skipped"
+    current_label_display_len=$(get_display_width "$label_text")
+    padding_needed=$((max_summary_label_len - current_label_display_len))
+    padded_label_part="${label_text}"
+    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
+    printf "%b  %s%3d%b\n" "${BLACK}${BOLD}" "$padded_label_part" "${CHECKS_COUNT[skip]}" "${NC}"
+
+    # Failures line
+    label_text="${ICON_FAIL} Failures"
+    current_label_display_len=$(get_display_width "$label_text")
+    padding_needed=$((max_summary_label_len - current_label_display_len))
+    padded_label_part="${label_text}"
+    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
+    printf "%b  %s%3d%b\n" "${RED}${BOLD}" "$padded_label_part" "${CHECKS_COUNT[fail]}" "${NC}"
+
+    # Info line
+    label_text="${ICON_INFO} Info"
+    current_label_display_len=$(get_display_width "$label_text")
+    padding_needed=$((max_summary_label_len - current_label_display_len))
+    padded_label_part="${label_text}"
+    for ((i=0; i<padding_needed; i++)); do padded_label_part+=" "; done
+    printf "%b  %s%3d%b\n" "${BLUE}${BOLD}" "$padded_label_part" "${CHECKS_COUNT[info]}" "${NC}"
 }
-
-main "$@"
