@@ -1,5 +1,6 @@
 # 🚀 Selenium Automation Framework 
 **Initial Maven Configuration-(v0.0.0)**
+![POM Validation](https://github.com/opencode-qa/testing-repo/actions/workflows/pom-validation.yml/badge.svg)
 
 > A scalable and modular automation framework foundation using Java, Selenium WebDriver, and TestNG.
 
