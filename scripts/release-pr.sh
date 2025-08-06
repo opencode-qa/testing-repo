@@ -13,23 +13,21 @@ SKIP_ICON="${WHITE}➤${NC}"
 OPTIONAL_ICON="${CYAN}◇${NC}"
 
 ICON_SUCCESS="🟢"
-ICON_PROCESSING="⚪"
+ICON_PROCESSING="🟡"
 ICON_FAILURE="🔴"
 
-print_step() { echo -e "${1} ${2}"; }
+print_step() { echo -e "${1} ${2}${NC}"; }
 abort_with_error() { echo -e "${RED}${ICON_FAILURE} $1${NC}"; exit 1; }
 
 show_progress_bar() {
   local current=$1 total=$2
   local percent=$((100 * current / total))
   local bar=""
-
   for ((i = 0; i < total; i++)); do
     if (( i < current )); then bar+="🟩"
     else bar+="⬛"
     fi
   done
-
   echo -e "\n${BLUE}Progress Summary:${NC}"
   echo -e "[${bar}] ${percent}% ($current/$total tasks completed)"
 }
@@ -42,7 +40,7 @@ declare -a COMPLETED_TASKS
 
 # === DEPENDENCY CHECK ===
 check_dependencies() {
-  for cmd in gh yq jq; do
+  for cmd in gh yq jq awk; do
     if ! command -v "$cmd" &>/dev/null; then
       abort_with_error "Required command '$cmd' not installed."
     fi
@@ -64,10 +62,35 @@ parse_arguments() {
   done
 }
 
-# === MAIN ===
+# === NORMALIZE FIELD: converts YAML field (string or array) to comma-separated string ===
+normalize_field() {
+  local field="$1"
+  # If field missing or null => empty string
+  # If array => join(",")
+  # Else string as is
+  echo "$YAML_FRONT_MATTER" | yq -r "
+    if (.$field == null) then \"\"
+    elif (type == \"object\" and .$field | type == \"!!seq\") then .$field | join(\",\")
+    else .$field
+    end
+  "
+}
+
+# === EXTRACT BODY AFTER FRONTMATTER ===
+extract_body() {
+  awk '
+    BEGIN {in_frontmatter=0; frontmatter_done=0}
+    /^---$/ {
+      if (in_frontmatter==0) {in_frontmatter=1; next}
+      else if (in_frontmatter==1) {frontmatter_done=1; next}
+    }
+    frontmatter_done==1 {print}
+  ' "$METADATA_FILE"
+}
+
+# === MAIN FUNCTION ===
 main() {
-  echo -e "${PURPLE}🚀 release-pr.sh — Create a GitHub Release Pull Request${NC}"
-  echo ""
+  echo -e "${PURPLE}🚀 release-pr.sh — Create a GitHub Release Pull Request${NC}\n"
 
   check_dependencies
   parse_arguments "$@"
@@ -77,7 +100,7 @@ main() {
   print_step "$ICON_PROCESSING" "Target branch: $TARGET_BRANCH"
   COMPLETED_TASKS+=("branch-checked")
 
-  # Determine metadata
+  # Locate metadata file if not provided
   if [[ -z "$METADATA_FILE" ]]; then
     BRANCH_KEY="${CURRENT_BRANCH#*/}"
     METADATA_FILE="${DEFAULT_METADATA_DIR}/${BRANCH_KEY}.md"
@@ -85,22 +108,27 @@ main() {
   [[ -f "$METADATA_FILE" ]] || abort_with_error "Metadata file '$METADATA_FILE' not found."
   COMPLETED_TASKS+=("metadata-located")
 
-  # Parse YAML front matter
+  # Read YAML frontmatter (between first two --- lines)
   YAML_FRONT_MATTER=$(awk 'BEGIN{in_yaml=0} /^---$/ {in_yaml+=1; next} in_yaml==1 {print}' "$METADATA_FILE")
-  ASSIGNEES=$(echo "$YAML_FRONT_MATTER" | yq '.assignees // [] | join(",")')
-  REVIEWERS=$(echo "$YAML_FRONT_MATTER" | yq '.reviewers // [] | join(",")')
-  MILESTONE=$(echo "$YAML_FRONT_MATTER" | yq '.milestone // ""')
-  LABELS=$(echo "$YAML_FRONT_MATTER" | yq '.labels // [] | join(",")')
-  [[ -z "$TITLE" ]] && TITLE=$(echo "$YAML_FRONT_MATTER" | yq '.title // "Release PR"')
 
+  # Normalize all fields using helper
+  ASSIGNEES=$(normalize_field "assignees")
+  REVIEWERS=$(normalize_field "reviewers")
+  LABELS=$(normalize_field "labels")
+  MILESTONE=$(normalize_field "milestone")
+  TITLE_VAL=$(normalize_field "title")
+  [[ -z "$TITLE" ]] && TITLE="$TITLE_VAL"
+  [[ -z "$TITLE" ]] && TITLE="Release PR"
+
+  # Extract or override body content
   if [[ -z "$BODY" ]]; then
-    BODY_CONTENT=$(awk '/^---$/ {count++} count==2 {next; in_body=1} in_body {print}' "$METADATA_FILE")
+    BODY_CONTENT=$(extract_body)
   else
     BODY_CONTENT="$BODY"
   fi
   COMPLETED_TASKS+=("metadata-parsed")
 
-  # === Dry Run ===
+  # Dry run mode: show parsed data and exit
   if [[ "$DRY_RUN" == true ]]; then
     echo -e "\n${YELLOW}--- Dry Run Mode ---${NC}"
     echo "Title     : $TITLE"
@@ -113,9 +141,9 @@ main() {
     exit 0
   fi
 
-  # Check CI
+  # Check GitHub Actions CI status on current branch
   REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  print_step "$ICON_PROCESSING" "Checking CI status on '$CURRENT_BRANCH'..."
+  print_step "$ICON_PROCESSING" "Checking CI status on branch '$CURRENT_BRANCH'..."
   RUN_STATUS=$(gh api "repos/$REPO/actions/runs?branch=$CURRENT_BRANCH&per_page=1" | jq -r '
     if (.workflow_runs | length)==0 then "no-runs"
     else "\(.workflow_runs[0].status)-\(.workflow_runs[0].conclusion)" end
@@ -129,7 +157,7 @@ main() {
   print_step "$ICON_SUCCESS" "CI passed."
   COMPLETED_TASKS+=("ci-ok")
 
-  # Create PR
+  # Create Pull Request
   print_step "$ICON_PROCESSING" "Creating pull request..."
   PR_OUT=$(gh pr create --title "$TITLE" --body "$BODY_CONTENT" --base "$TARGET_BRANCH" --head "$CURRENT_BRANCH" 2>&1) \
     || abort_with_error "Failed to create PR: $PR_OUT"
@@ -139,9 +167,12 @@ main() {
   print_step "$ICON_SUCCESS" "PR created: $PR_URL"
   COMPLETED_TASKS+=("pr-created")
 
-  # Add Labels
+  # Add Labels: ensure branch name as label always included
   LABELS="$LABELS,${CURRENT_BRANCH##*/}"
-  for lbl in $(echo "$LABELS" | tr ',' '\n' | sed '/^$/d'); do
+  # Clean duplicates and empty labels
+  mapfile -t UNIQUE_LABELS < <(echo "$LABELS" | tr ',' '\n' | awk '!x[$0]++ && length($0)>0')
+  for lbl in "${UNIQUE_LABELS[@]}"; do
+    # Check if label exists, if not create it
     if ! gh label list | awk '{print $1}' | grep -qx "$lbl"; then
       gh label create "$lbl" --color ededee --description "Auto label" >/dev/null
     fi
@@ -149,26 +180,41 @@ main() {
   done
   COMPLETED_TASKS+=("labels-added")
 
-  # Assign assignees/reviewers
-  [[ -n "$ASSIGNEES" ]] && gh pr edit "$PR_NUMBER" --add-assignee "$ASSIGNEES" >/dev/null && print_step "$ICON_SUCCESS" "Assigned: $ASSIGNEES"
-  [[ -n "$REVIEWERS" ]] && gh pr edit "$PR_NUMBER" --add-reviewer "$REVIEWERS" >/dev/null && print_step "$ICON_SUCCESS" "Reviewers: $REVIEWERS"
+  # Assign assignees and reviewers if specified
+  if [[ -n "$ASSIGNEES" ]]; then
+    # split comma and assign each separately to avoid gh cli issues
+    IFS=',' read -ra ASSIGNEE_ARR <<< "$ASSIGNEES"
+    for assignee in "${ASSIGNEE_ARR[@]}"; do
+      gh pr edit "$PR_NUMBER" --add-assignee "$assignee" >/dev/null || print_step "$WARN_ICON" "Failed to assign: $assignee"
+    done
+    print_step "$ICON_SUCCESS" "Assigned: $ASSIGNEES"
+  fi
+
+  if [[ -n "$REVIEWERS" ]]; then
+    IFS=',' read -ra REVIEWER_ARR <<< "$REVIEWERS"
+    for reviewer in "${REVIEWER_ARR[@]}"; do
+      gh pr edit "$PR_NUMBER" --add-reviewer "$reviewer" >/dev/null || print_step "$WARN_ICON" "Failed to add reviewer: $reviewer"
+    done
+    print_step "$ICON_SUCCESS" "Reviewers: $REVIEWERS"
+  fi
   COMPLETED_TASKS+=("assignments-done")
 
-  # Set milestone
+  # Set milestone if specified
   if [[ -n "$MILESTONE" ]]; then
-    MID=$(gh api "repos/$REPO/milestones" | jq ".[] | select(.title==\"$MILESTONE\").number")
+    MID=$(gh api "repos/$REPO/milestones" -q ".milestones[] | select(.title == \"$MILESTONE\") | .number")
     if [[ -n "$MID" ]]; then
-      gh api -X PATCH "repos/$REPO/issues/$PR_NUMBER" -f milestone="$MID" >/dev/null
+      gh pr edit "$PR_NUMBER" --milestone "$MID" >/dev/null
       print_step "$ICON_SUCCESS" "Milestone set: $MILESTONE"
     else
       print_step "$WARN_ICON" "Milestone '$MILESTONE' not found."
     fi
+    COMPLETED_TASKS+=("milestone-set")
   fi
-  COMPLETED_TASKS+=("milestone-set")
 
-  # === Final Output ===
-  show_progress_bar ${#COMPLETED_TASKS[@]} 8
-  echo -e "\n${GREEN}✓ release-pr.sh completed successfully!${NC}"
+  show_progress_bar "${#COMPLETED_TASKS[@]}" 10
+
+  echo -e "\n${GREEN}🎉 Release PR process complete!${NC}"
+  echo "View your PR here: $PR_URL"
 }
 
 main "$@"
