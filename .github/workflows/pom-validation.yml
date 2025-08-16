@@ -38,11 +38,11 @@ jobs:
           cache: 'maven'
 
       - name: 🔒 Set execute permission on script
-        run: chmod +x scripts/validate-pom.sh
+        run: chmod +x scripts/pom-validator.sh
 
       - name: 🚀 Run custom POM validator script
         id: custom_validator
-        run: ./scripts/validate-pom.sh --graph --html
+        run: ./scripts/pom-validator.sh --graph --html
         # Capture the exit code of the script for later checks
         continue-on-error: true
 
