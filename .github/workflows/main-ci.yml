@@ -2,9 +2,9 @@ name: "🚀 Main CI Pipeline"
 
 on:
   pull_request:
-    branches: [main]  # Added dev branch
+    branches: [main, dev]  # Added dev branch
   push:
-    branches: [main]  # Added dev branch
+    branches: [main, dev]  # Added dev branch
 
 jobs:
   validate-pom:
