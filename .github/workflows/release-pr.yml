@@ -1,23 +1,72 @@
-name: "🚀 Release Automation"
+name: "Release Automation"
+
+# Top-level permissions for workflow_run trigger
+permissions:
+  actions: read
+  contents: read
+  checks: read
+  statuses: read
 
 on:
   workflow_run:
-    workflows: ["🚀 Main CI Pipeline"]
+    workflows: ["Main CI Pipeline"]
     branches: [main]
     types: [completed]
+
+env:
+  RELEASE_CONTEXT: release-automation   # ASCII-safe context name
 
 jobs:
   release:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     name: "Release Manager"
     runs-on: ubuntu-latest
+
+    # Job-specific permissions
     permissions:
       contents: write
       statuses: write
       checks: write
       pull-requests: write
+      actions: read
 
     steps:
+      # Debugging step to diagnose trigger issues
+      - name: Debug Workflow Trigger
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== DEBUG INFORMATION ==="
+          echo "Event: ${{ toJson(github.event) }}"
+          echo "Workflow Name: ${{ github.event.workflow_run.name }}"
+          echo "Branch: ${{ github.event.workflow_run.head_branch }}"
+          echo "Conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "SHA: ${{ github.event.workflow_run.head_sha }}"
+          echo "Run ID: ${{ github.event.workflow_run.id }}"
+          echo "Workflow URL: ${{ github.event.workflow_run.html_url }}"
+          echo "Repository: ${{ github.repository }}"
+
+          # Get workflow information via API
+          echo "Getting workflow information via API..."
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows" \
+            | jq '.workflows[] | {id, name, path}'
+
+          # Check if the workflow exists
+          echo "Checking if 'Main CI Pipeline' workflow exists..."
+          WORKFLOW_EXISTS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows" \
+            | jq '.workflows[].name' | grep -c "Main CI Pipeline")
+
+          if [ "$WORKFLOW_EXISTS" -eq 0 ]; then
+            echo "::error::'Main CI Pipeline' workflow not found!"
+            exit 1
+          else
+            echo "'Main CI Pipeline' workflow exists"
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -25,18 +74,17 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
-      - name: List existing tags
-        run: git tag -l
-
       - name: Determine version
         id: version
         run: |
+          # Check if any tags exist
           if [ -z "$(git tag -l)" ]; then
-            # First release
+            echo "No tags found - initial release"
             echo "new_version=0.0.0" >> $GITHUB_OUTPUT
             echo "new_tag=v0.0.0" >> $GITHUB_OUTPUT
             echo "is_initial_release=true" >> $GITHUB_OUTPUT
           else
+            echo "Tags exist - subsequent release"
             LATEST_TAG=$(git describe --tags --abbrev=0)
             IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
             NEW_VERSION="${MAJOR}.$((MINOR+1)).0"
@@ -45,62 +93,122 @@ jobs:
             echo "is_initial_release=false" >> $GITHUB_OUTPUT
           fi
 
+          echo "Version outputs:"
+          echo "new_version: ${{ steps.version.outputs.new_version }}"
+          echo "new_tag: ${{ steps.version.outputs.new_tag }}"
+          echo "is_initial_release: ${{ steps.version.outputs.is_initial_release }}"
+
       - name: Start release process
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'pending',
-              context: '🚀 Release Automation',
-              description: 'Release process initializing'
-            })
+            try {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.workflow_run.head_sha }}',
+                state: 'pending',
+                context: process.env.RELEASE_CONTEXT,
+                description: 'Release process initializing'
+              });
+              console.log('Created pending commit status');
+            } catch (error) {
+              console.error('Error creating commit status:', error);
+              core.setFailed('Failed to create commit status');
+            }
 
       - name: Create release tag
         run: |
+          TAG="${{ steps.version.outputs.new_tag }}"
+          MSG="Release $TAG"
           if [[ "${{ steps.version.outputs.is_initial_release }}" == 'true' ]]; then
-            TAG="v0.0.0"
             MSG="Initial release"
-          else
-            TAG="${{ steps.version.outputs.new_tag }}"
-            MSG="Release $TAG"
           fi
 
-          echo "Creating tag: $TAG"
+          echo "Creating tag: $TAG with message: '$MSG'"
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          git tag -a $TAG -m "$MSG"
-          git push origin $TAG
+          git tag -a "$TAG" -m "$MSG"
+          git push origin "$TAG"
+          echo "Tag pushed successfully"
 
           # Verify tag exists
-          sleep 3
-          git ls-remote --tags origin $TAG
+          echo "Verifying tag exists remotely..."
+          for i in {1..10}; do
+            if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+              echo "Tag $TAG confirmed on remote"
+              break
+            fi
+            echo "Waiting for tag sync... (attempt $i/10)"
+            sleep 5
+          done
 
       - name: Generate changelog
         if: ${{ steps.version.outputs.is_initial_release != 'true' }}
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 ${{ steps.version.outputs.new_tag }}^)
-          echo "# Changes since $PREV_TAG" > CHANGELOG.md
-          git log $PREV_TAG..HEAD --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md
+          PREV_TAG=$(git describe --tags --abbrev=0 ${{ steps.version.outputs.new_tag }}^ 2>/dev/null || echo "")
 
-      - name: Publish release
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found, generating full changelog"
+            echo "# 📦 Initial Release ${{ steps.version.outputs.new_tag }}" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          else
+            echo "Generating changelog from $PREV_TAG to ${{ steps.version.outputs.new_tag }}"
+            echo "# 📦 Changelog for ${{ steps.version.outputs.new_tag }}" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "## ✨ Features" >> CHANGELOG.md
+            git log "$PREV_TAG"..HEAD --grep="^feat" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md || true
+            echo "" >> CHANGELOG.md
+            echo "## 🐛 Fixes" >> CHANGELOG.md
+            git log "$PREV_TAG"..HEAD --grep="^fix" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md || true
+            echo "" >> CHANGELOG.md
+            echo "## 🛠 Chores" >> CHANGELOG.md
+            git log "$PREV_TAG"..HEAD --grep="^chore" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md || true
+            echo "" >> CHANGELOG.md
+            echo "## 📚 Other changes" >> CHANGELOG.md
+            git log "$PREV_TAG"..HEAD --invert-grep --grep="^feat" --grep="^fix" --grep="^chore" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md || true
+          fi
+
+          echo "Generated CHANGELOG.md:"
+          cat CHANGELOG.md
+
+      - name: Publish initial release
+        if: ${{ steps.version.outputs.is_initial_release == 'true' }}
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.new_tag }}
-          name: ${{ steps.version.outputs.is_initial_release == 'true' && 'Initial Release v0.0.0' || format('Release {0}', steps.version.outputs.new_tag) }}
-          body: ${{ steps.version.outputs.is_initial_release == 'true' && '🚀 First official release!' || '' }}
-          body_path: ${{ steps.version.outputs.is_initial_release != 'true' && 'CHANGELOG.md' || '' }}
+          name: Initial Release v0.0.0
+          body: |
+            🚀 First official release of the automation framework.
+            ### What's included
+            - Initial Maven + Selenium + TestNG setup
+            - CI/CD integration
+            - Branching & tagging workflow
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Publish subsequent release
+        if: ${{ steps.version.outputs.is_initial_release != 'true' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.new_tag }}
+          name: Release ${{ steps.version.outputs.new_tag }}
+          body_path: CHANGELOG.md
           generate_release_notes: true
           draft: false
           prerelease: false
 
       - name: Bump to next snapshot version
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0)
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
-          NEXT_VERSION="${MAJOR}.$((MINOR+1)).0-SNAPSHOT"
+          if [[ "${{ steps.version.outputs.is_initial_release }}" == 'true' ]]; then
+            NEXT_VERSION="0.1.0-SNAPSHOT"
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0)
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+            NEXT_VERSION="${MAJOR}.$((MINOR+1)).0-SNAPSHOT"
+          fi
 
           echo "Bumping to next development version: $NEXT_VERSION"
           mvn versions:set -DnewVersion=$NEXT_VERSION -DgenerateBackupPoms=false
@@ -110,16 +218,25 @@ jobs:
           git add pom.xml
           git commit -m "chore: start next development iteration $NEXT_VERSION [skip ci]"
           git push origin HEAD:main
+          echo "Version bumped and pushed to main"
 
       - name: Report completion
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.new_tag }}
         with:
           script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'success',
-              context: '🚀 Release Automation',
-              description: 'Release ${{ steps.version.outputs.new_tag }} completed'
-            })
+            try {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.workflow_run.head_sha }}',
+                state: 'success',
+                context: process.env.RELEASE_CONTEXT,
+                description: `Release ${process.env.RELEASE_TAG} completed`
+              });
+              console.log('Created success commit status');
+            } catch (error) {
+              console.error('Error creating success status:', error);
+              core.setFailed('Failed to create success status');
+            }
