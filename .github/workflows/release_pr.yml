@@ -25,6 +25,19 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
+      - name: Report 🚀 Release Automation pending
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.workflow_run.head_sha }}',
+              state: 'pending',
+              context: '🚀 Release Automation',
+              description: 'Release process initializing'
+            })
+
       - name: List existing tags
         run: git tag -l
 
@@ -43,19 +56,6 @@ jobs:
             echo "new_tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
             echo "is_initial_release=false" >> $GITHUB_OUTPUT
           fi
-
-      - name: Start release process
-        uses: actions/github-script@v6
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'pending',
-              context: '🚀 Release Automation',
-              description: 'Release process initializing'
-            })
 
       - name: Update project version
         if: ${{ steps.version.outputs.is_initial_release != 'true' }}
@@ -80,7 +80,6 @@ jobs:
           git tag -a $TAG -m "$MSG"
           git push origin $TAG
 
-          # Verify tag
           sleep 3
           git ls-remote --tags origin $TAG
 
@@ -101,7 +100,8 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Report completion
+      - name: Report 🚀 Release Automation success
+        if: success()
         uses: actions/github-script@v6
         with:
           script: |
@@ -112,4 +112,18 @@ jobs:
               state: 'success',
               context: '🚀 Release Automation',
               description: 'Release ${{ steps.version.outputs.new_tag }} completed'
+            })
+
+      - name: Report 🚀 Release Automation failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.workflow_run.head_sha }}',
+              state: 'failure',
+              context: '🚀 Release Automation',
+              description: 'Release failed'
             })
