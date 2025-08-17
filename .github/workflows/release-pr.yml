@@ -32,6 +32,7 @@ jobs:
         id: version
         run: |
           if [ -z "$(git tag -l)" ]; then
+            # First release
             echo "new_version=0.0.0" >> $GITHUB_OUTPUT
             echo "new_tag=v0.0.0" >> $GITHUB_OUTPUT
             echo "is_initial_release=true" >> $GITHUB_OUTPUT
@@ -56,18 +57,6 @@ jobs:
               context: '🚀 Release Automation',
               description: 'Release process initializing'
             })
-
-      # Only update POM for non-initial releases
-      - name: Update project version
-        if: ${{ steps.version.outputs.is_initial_release != 'true' }}
-        run: |
-          echo "Updating pom.xml to ${{ steps.version.outputs.new_version }}"
-          mvn versions:set -DnewVersion=${{ steps.version.outputs.new_version }} -DgenerateBackupPoms=false
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git add pom.xml
-          git commit -m "chore: release ${{ steps.version.outputs.new_tag }} [skip ci]"
-          git push origin HEAD:main
 
       - name: Create release tag
         run: |
@@ -100,11 +89,27 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.new_tag }}
-          name: "Release ${{ steps.version.outputs.new_tag }}"
-          body_path: CHANGELOG.md
+          name: ${{ steps.version.outputs.is_initial_release == 'true' && 'Initial Release v0.0.0' || format('Release {0}', steps.version.outputs.new_tag) }}
+          body: ${{ steps.version.outputs.is_initial_release == 'true' && '🚀 First official release!' || '' }}
+          body_path: ${{ steps.version.outputs.is_initial_release != 'true' && 'CHANGELOG.md' || '' }}
           generate_release_notes: true
           draft: false
           prerelease: false
+
+      - name: Bump to next snapshot version
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+          NEXT_VERSION="${MAJOR}.$((MINOR+1)).0-SNAPSHOT"
+
+          echo "Bumping to next development version: $NEXT_VERSION"
+          mvn versions:set -DnewVersion=$NEXT_VERSION -DgenerateBackupPoms=false
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add pom.xml
+          git commit -m "chore: start next development iteration $NEXT_VERSION [skip ci]"
+          git push origin HEAD:main
 
       - name: Report completion
         uses: actions/github-script@v6
