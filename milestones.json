@@ -1,0 +1,14 @@
+{
+  "v0.0.0": "Maven initial configuration",
+  "v0.1.0": "Simple Test Creation",
+  "v0.2.0": "CI setup",
+  "v0.3.0": "Log4j2 integration",
+  "v0.4.0": "Exception Handling",
+  "v0.5.0": "Driver Management",
+  "v0.6.0": "Page Object Model",
+  "v0.7.0": "Wait Utilities",
+  "v0.8.0": "Screenshot Utility",
+  "v0.9.0": "TestNG Listeners",
+  "v1.0.0": "Allure Integration",
+  "v1.1.0": "Retry Mechanism"
+}
