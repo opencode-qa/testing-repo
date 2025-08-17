@@ -17,15 +17,21 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      statuses: write
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine version
+      - name: Setup Git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Determine next version
         id: version
         run: |
           if [ -z "$(git tag -l)" ]; then
@@ -54,8 +60,6 @@ jobs:
       - name: Create release branch
         if: steps.check-tag.outputs.tag_exists == 'false'
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
           RELEASE_BRANCH="release/${{ steps.version.outputs.new_tag }}"
           git checkout -b $RELEASE_BRANCH
           git push origin $RELEASE_BRANCH
@@ -69,7 +73,7 @@ jobs:
           git push origin "$TAG"
           echo "Pushed tag: $TAG"
 
-          # Wait for tag to be fully available
+          # Verify tag was created
           sleep 5
           git fetch --tags --force
           if ! git show-ref --tags "$TAG"; then
@@ -87,13 +91,14 @@ jobs:
             PREV_TAG=$(git describe --tags --abbrev=0 ${{ steps.version.outputs.new_tag }}^ 2>/dev/null || echo "")
             echo "# Changes since ${PREV_TAG:-beginning}" > CHANGELOG.md
             echo "" >> CHANGELOG.md
-            echo "## Commits" >> CHANGELOG.md
-            git log ${PREV_TAG:+$PREV_TAG..}HEAD --pretty=format:"- %s (%h) [%an]" --no-merges >> CHANGELOG.md
+            echo "## Features" >> CHANGELOG.md
+            git log ${PREV_TAG:+$PREV_TAG..}HEAD --grep="^feat" --pretty=format:"- %s (%h) [%an]" --no-merges >> CHANGELOG.md || echo "- No new features" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "## Fixes" >> CHANGELOG.md
+            git log ${PREV_TAG:+$PREV_TAG..}HEAD --grep="^fix" --pretty=format:"- %s (%h) [%an]" --no-merges >> CHANGELOG.md || echo "- No bug fixes" >> CHANGELOG.md
           fi
-          echo "CHANGELOG.md generated"
 
       - name: Create GitHub release
-        id: create-release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.new_tag }}
@@ -102,30 +107,12 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-          fail_on_unmatched: false  # Continue if tag doesn't exist
-        continue-on-error: true
+          fail_on_unmatched: false
 
-      - name: Verify release creation
-        if: steps.create-release.outcome != 'success'
+      - name: Prepare version bump PR
+        id: version-bump
         run: |
-          # Check if release exists via API
-          RELEASE_EXISTS=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.new_tag }}" \
-            | jq -e '.id' >/dev/null 2>&1 && echo "true" || echo "false")
-
-          if [[ "$RELEASE_EXISTS" == "false" ]]; then
-            echo "::error::Failed to create release for ${{ steps.version.outputs.new_tag }}"
-            exit 1
-          else
-            echo "::notice::Release already exists for ${{ steps.version.outputs.new_tag }}"
-          fi
-
-      - name: Bump version on main
-        run: |
-          git checkout main
-          git pull origin main
-
+          # Calculate next version
           if [[ "${{ steps.version.outputs.is_initial_release }}" == 'true' ]]; then
             NEXT_VERSION="0.1.0-SNAPSHOT"
           else
@@ -134,12 +121,48 @@ jobs:
             NEXT_VERSION="${MAJOR}.$((MINOR+1)).0-SNAPSHOT"
           fi
 
+          # Check if PR already exists
+          PR_EXISTS=$(gh pr list --search "in:title 'Version bump to $NEXT_VERSION'" --json id --jq length)
+          if [ "$PR_EXISTS" -gt 0 ]; then
+            echo "::notice::Version bump PR already exists"
+            echo "pr_created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Create new branch
+          git checkout main
+          git pull origin main
+          git checkout -b "version-bump/$NEXT_VERSION"
+
+          # Update version
           mvn versions:set -DnewVersion=$NEXT_VERSION -DgenerateBackupPoms=false
+
+          # Commit and push
           git add pom.xml
           git commit -m "chore: bump version to $NEXT_VERSION [skip ci]"
-          git push origin main
+          git push origin "version-bump/$NEXT_VERSION"
+
+          # Create PR
+          gh pr create \
+            --title "Version bump to $NEXT_VERSION" \
+            --body "Automated version bump after release ${{ steps.version.outputs.new_tag }}" \
+            --base main \
+            --head "version-bump/$NEXT_VERSION" \
+            --label "automated,version-bump"
+
+          echo "pr_created=true" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-merge version bump PR
+        if: steps.version-bump.outputs.pr_created == 'true'
+        run: |
+          NEXT_VERSION="${{ steps.version-bump.outputs.NEXT_VERSION || '0.1.0-SNAPSHOT' }}"
+          gh pr merge --auto --squash "version-bump/$NEXT_VERSION"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cleanup release branch
         if: always() && steps.check-tag.outputs.tag_exists == 'false'
         run: |
-          git push origin --delete "release/${{ steps.version.outputs.new_tag }}" || echo "Branch already deleted"
+          git push origin --delete "release/${{ steps.version.outputs.new_tag }}" || echo "Release branch already deleted"
