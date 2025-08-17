@@ -1,8 +1,8 @@
-name: "🚀 Release Automation"
+name: "🚀 Release Automation"  # Must match EXACTLY your branch protection rule
 
 on:
   workflow_run:
-    workflows: ["🚀 Main CI Pipeline"]
+    workflows: ["Main CI Pipeline"]
     branches: [main]
     types: [completed]
 
@@ -11,6 +11,8 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     name: "Release Manager"
     runs-on: ubuntu-latest
+
+    # CRITICAL PERMISSIONS
     permissions:
       contents: write
       statuses: write
@@ -18,14 +20,44 @@ jobs:
       pull-requests: write
 
     steps:
+      # 1. CHECKOUT WITH EXPLICIT SHA AND TOKEN
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
+          fetch-depth: 0  # Required for version detection
 
-      - name: Report 🚀 Release Automation pending
+      # 2. DEBUG: PRINT CURRENT TAGS
+      - name: List existing tags
+        run: git tag -l
+
+      # 3. VERSION HANDLING (GUARANTEED v0.0.0 FIRST RUN)
+      - name: Determine version
+        id: version
+        run: |
+          # Debug current state
+          echo "Current tags:"
+          git tag -l
+
+          # Determine new version
+          if [ -z "$(git tag -l)" ]; then
+            echo "new_version=0.0.0" >> $GITHUB_OUTPUT
+            echo "new_tag=v0.0.0" >> $GITHUB_OUTPUT
+            echo "is_initial_release=true" >> $GITHUB_OUTPUT
+            echo "Detected: Initial release (v0.0.0)"
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0)
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+            NEW_VERSION="${MAJOR}.$((MINOR+1)).0"
+            echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "new_tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "is_initial_release=false" >> $GITHUB_OUTPUT
+            echo "Detected: Next version (v$NEW_VERSION)"
+          fi
+
+      # 4. INITIAL STATUS REPORT (MATCHES BRANCH PROTECTION)
+      - name: Start release process
         uses: actions/github-script@v6
         with:
           script: |
@@ -38,27 +70,8 @@ jobs:
               description: 'Release process initializing'
             })
 
-      - name: List existing tags
-        run: git tag -l
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ -z "$(git tag -l)" ]; then
-            echo "new_version=0.0.0" >> $GITHUB_OUTPUT
-            echo "new_tag=v0.0.0" >> $GITHUB_OUTPUT
-            echo "is_initial_release=true" >> $GITHUB_OUTPUT
-          else
-            LATEST_TAG=$(git describe --tags --abbrev=0)
-            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
-            NEW_VERSION="${MAJOR}.$((MINOR+1)).0"
-            echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-            echo "new_tag=v$NEW_VERSION" >> $GITHUB_OUTPUT
-            echo "is_initial_release=false" >> $GITHUB_OUTPUT
-          fi
-
+      # 5. UPDATE POM VERSION
       - name: Update project version
-        if: ${{ steps.version.outputs.is_initial_release != 'true' }}
         run: |
           echo "Updating pom.xml to ${{ steps.version.outputs.new_version }}"
           mvn versions:set -DnewVersion=${{ steps.version.outputs.new_version }} -DgenerateBackupPoms=false
@@ -66,30 +79,29 @@ jobs:
           git commit -m "chore: release ${{ steps.version.outputs.new_tag }} [skip ci]"
           git push origin HEAD:main
 
+      # 6. CREATE AND VERIFY TAG
       - name: Create release tag
         run: |
-          if [[ "${{ steps.version.outputs.is_initial_release }}" == 'true' ]]; then
-            TAG="v0.0.0"
-            MSG="Initial release"
-          else
-            TAG="${{ steps.version.outputs.new_tag }}"
-            MSG="Release $TAG"
-          fi
+          echo "Creating tag: ${{ steps.version.outputs.new_tag }}"
+          git tag -a ${{ steps.version.outputs.new_tag }} -m "Release ${{ steps.version.outputs.new_tag }}"
+          git push origin ${{ steps.version.outputs.new_tag }}
 
-          echo "Creating tag: $TAG"
-          git tag -a $TAG -m "$MSG"
-          git push origin $TAG
+          # Verify tag exists remotely
+          echo "Verifying tag exists..."
+          sleep 3  # Allow time for propagation
+          git ls-remote --tags origin ${{ steps.version.outputs.new_tag }}
 
-          sleep 3
-          git ls-remote --tags origin $TAG
-
+      # 7. GENERATE CHANGELOG
       - name: Generate changelog
-        if: ${{ steps.version.outputs.is_initial_release != 'true' }}
+        if: steps.version.outputs.is_initial_release == 'false'
         run: |
           PREV_TAG=$(git describe --tags --abbrev=0 ${{ steps.version.outputs.new_tag }}^)
           echo "# Changes since $PREV_TAG" > CHANGELOG.md
           git log $PREV_TAG..HEAD --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md
+          echo "Generated changelog:"
+          cat CHANGELOG.md
 
+      # 8. CREATE GITHUB RELEASE
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
@@ -100,8 +112,8 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Report 🚀 Release Automation success
-        if: success()
+      # 9. FINAL SUCCESS STATUS (CRITICAL)
+      - name: Report completion
         uses: actions/github-script@v6
         with:
           script: |
@@ -114,16 +126,9 @@ jobs:
               description: 'Release ${{ steps.version.outputs.new_tag }} completed'
             })
 
-      - name: Report 🚀 Release Automation failure
-        if: failure()
-        uses: actions/github-script@v6
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
-              state: 'failure',
-              context: '🚀 Release Automation',
-              description: 'Release failed'
-            })
+      # 10. DEBUG: CONFIRM STATUS
+      - name: Verify status update
+        run: |
+          echo "Confirming status update..."
+          gh api /repos/$GITHUB_REPOSITORY/commits/${{ github.event.workflow_run.head_sha }}/statuses \
+            | jq '.[] | select(.context == "🚀 Release Automation")'
